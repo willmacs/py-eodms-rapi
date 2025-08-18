@@ -28,7 +28,8 @@ jobs:
       # Install package from setup.py
       - name: Install package from setup.py
         run: |
-          sudo python setup.py install
+          sudo pip install -e .
+          sudo pip install -r requirements.txt
 
       # Runs a single command using the runners shell
       - name: Run py-eodms-rapi Version Check
