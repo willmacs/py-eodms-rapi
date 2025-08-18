@@ -2,11 +2,11 @@ from setuptools import find_packages, setup
 
 setup(
     name='py-eodms-rapi',
-    version='1.10.3', 
+    version='1.10.4',
     author='Kevin Ballantyne (Natural Resources Canada)',
     author_email='kevin.ballantyne@nrcan-rncan.gc.ca',
     packages=find_packages(),
-    include_package_data=True, 
+    include_package_data=True,
     url='https://py-eodms-rapi.readthedocs.io/en/latest/',
     license='LICENSE',
     description='EODMS RAPI Client is a Python3 package used to access the ' \
@@ -15,14 +15,14 @@ setup(
     long_description=open('README.md').read(),
     long_description_content_type="text/markdown",
     install_requires=[
-        "dateparser", 
+        "dateparser",
         "requests",
         "tqdm",
         "geomet",
         "lxml",
     ],
     project_urls={
-        "Source": "https://github.com/eodms-sgdot/py-eodms-rapi", 
+        "Source": "https://github.com/eodms-sgdot/py-eodms-rapi",
         "Bug Tracker": "https://github.com/eodms-sgdot/py-eodms-rapi/issues",
     },
     classifiers=[
