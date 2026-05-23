@@ -27,6 +27,7 @@
 
 
 import os
+import html
 # import sys
 import requests
 # import logging
@@ -43,7 +44,7 @@ import dateparser
 import re
 import dateutil.parser
 from dateutil.tz import tzlocal
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse, parse_qsl, urlunparse, quote
 # from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
 from xml.etree import ElementTree
@@ -1652,7 +1653,110 @@ class EODMSRAPI:
 
         self.rapi_root = url
 
-    def download_image(self, url, dest_fn, fsize, show_progress=True):
+    def _ddssrv_with_format_json(self, url):
+        """
+        Appends format=json to a ddssrv URL if not already present.
+        """
+
+        parsed = urlparse(url)
+        query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+        has_format = any(str(k).lower() == 'format' for k, _ in query_pairs)
+        if has_format:
+            return url
+
+        query_pairs.append(('format', 'json'))
+        new_query = urlencode(query_pairs)
+        return urlunparse((
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path,
+            parsed.params,
+            new_query,
+            parsed.fragment,
+        ))
+
+    def _ddssrv_list(self, url):
+        """
+        Returns ddssrv JSON listing for a directory URL.
+        """
+
+        list_url = self._ddssrv_with_format_json(url)
+        res = self._session.get(list_url, verify=self.verify,
+                                timeout=self.timeout_query)
+        if not res.ok:
+            return None
+
+        try:
+            payload = res.json()
+        except ValueError:
+            return None
+
+        if isinstance(payload, list):
+            return payload
+
+        return None
+
+    def _ddssrv_child_url(self, parent_url, name):
+        """
+        Builds a child URL under a ddssrv directory URL.
+        """
+
+        parsed = urlparse(parent_url)
+        base_path = parsed.path if parsed.path else '/'
+        if not base_path.endswith('/'):
+            base_path += '/'
+
+        quoted_name = quote(str(name), safe='/')
+        child_path = f"{base_path}{quoted_name}"
+
+        child = parsed._replace(path=child_path, query='', fragment='')
+        return child.geturl()
+
+    def _ddssrv_collect_files(self, root_url):
+        """
+        Recursively collects file URLs and relative paths from a ddssrv URL.
+        """
+
+        found_files = []
+
+        def _walk(curr_url, rel_prefix=''):
+            entries = self._ddssrv_list(curr_url)
+            if not isinstance(entries, list):
+                return
+
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+
+                name = entry.get('name')
+                if name is None:
+                    continue
+
+                entry_type = str(entry.get('type', '')).lower()
+                child_rel = os.path.join(rel_prefix, str(name)) \
+                    if rel_prefix else str(name)
+                child_url = self._ddssrv_child_url(curr_url, name)
+
+                if entry_type == 'directory':
+                    _walk(child_url, child_rel)
+                elif entry_type == 'file':
+                    size_raw = entry.get('size')
+                    try:
+                        file_size = int(size_raw) if size_raw is not None else None
+                    except (ValueError, TypeError):
+                        file_size = None
+
+                    found_files.append({
+                        'url': child_url,
+                        'relative_path': child_rel,
+                        'size': file_size,
+                    })
+
+        _walk(root_url)
+
+        return found_files
+
+    def download_image(self, url, dest_fn, fsize=None, show_progress=True):
         """
         Given a list of remote and local items, download the remote data if
         it is not already found locally.
@@ -1665,7 +1769,7 @@ class EODMSRAPI:
         :param dest_fn: The local destination filename for the download.
         :type  dest_fn: str
         :param fsize: The total filesize of the image.
-        :type  fsize: int
+        :type  fsize: int or None
         :param show_progress: Determines whether to show progress while
         downloading an image
         :type  show_progress: bool
@@ -1675,7 +1779,12 @@ class EODMSRAPI:
         #   manifest
         if os.path.exists(dest_fn):
             # if all-good, continue to next file
-            if os.stat(dest_fn).st_size == fsize:
+            if fsize is not None and os.stat(dest_fn).st_size == fsize:
+                msg = f"No download necessary. Local file already exists: " \
+                      f"{dest_fn}"
+                self.log_msg(msg)
+                return None
+            elif fsize is None and os.stat(dest_fn).st_size > 0:
                 msg = f"No download necessary. Local file already exists: " \
                       f"{dest_fn}"
                 self.log_msg(msg)
@@ -1707,6 +1816,16 @@ class EODMSRAPI:
         else:
             response = self._session.get(url, stream=True, verify=self.verify)
             open(dest_fn, "wb").write(response.content)
+
+        if fsize is not None:
+            if not os.path.exists(dest_fn) or os.stat(dest_fn).st_size != fsize:
+                actual_size = os.stat(dest_fn).st_size if os.path.exists(dest_fn) else 0
+                msg = f"Downloaded filesize mismatch for {os.path.basename(dest_fn)} " \
+                      f"(expected {fsize}, got {actual_size})."
+                self.log_msg(msg, 'warning')
+                if os.path.exists(dest_fn):
+                    os.remove(dest_fn)
+                raise IOError(msg)
 
         msg = f'{dest_fn} has been downloaded.'
         self.log_msg(msg)
@@ -1869,7 +1988,7 @@ class EODMSRAPI:
                     complete_items.append(cur_item)
 
                 elif status == 'AVAILABLE_FOR_DOWNLOAD':
-                    cur_item['downloaded'] = 'True'
+                    cur_item['downloaded'] = 'False'
 
                     dests = cur_item['destinations']
                     manifest_key = list(cur_item['manifest'].keys()).pop()
@@ -1877,44 +1996,82 @@ class EODMSRAPI:
 
                     download_paths = []
                     for d in dests:
-
-                        # Get the string value of the destination
-                        str_val = d['stringValue']
-                        str_val = str_val.replace('</br>', '')
-
-                        str_val = str_val.replace('&', '?')
-
-                        # Parse the HTML text of the destination string
-                        root = ElementTree.fromstring(str_val)
-                        url = root.text
-                        url = url.split("?")[0]
-
-                        fn = os.path.basename(url)
-
-                        # Download the image
-                        msg = f"Downloading image from Collection {coll_id} " \
-                              f"with Record Id {record_id} ({fn})."
-                        self.log_msg(msg)
-
-                        # Save the image contents to the 'downloads' folder
-                        out_fn = os.path.join(dest, fn)
-                        full_path = os.path.realpath(out_fn)
-
-                        if not os.path.exists(dest):
-                            os.makedirs(dest, exist_ok=True)
-
-                        try:
-                            self.download_image(url, out_fn, fsize,
-                                                show_progress=show_progress)
-                        except Exception as e:
-                            self.log_msg(e, 'warning')
+                        url = self.extract_destination_url(d)
+                        if not url:
+                            self.log_msg("Could not parse destination URL; skipping destination.",
+                                         'warning')
                             continue
 
-                        print('')
+                        recursive_files = self._ddssrv_collect_files(url)
+                        if recursive_files:
+                            for file_info in recursive_files:
+                                file_url = file_info['url']
+                                rel_path = file_info['relative_path']
+                                file_size = file_info['size']
 
-                        # Record the URL and downloaded file to a dictionary
-                        dest_info = {'url': url, 'local_destination': full_path}
-                        download_paths.append(dest_info)
+                                msg = f"Downloading image from Collection {coll_id} " \
+                                      f"with Record Id {record_id} ({rel_path})."
+                                self.log_msg(msg)
+
+                                out_fn = os.path.join(dest, rel_path)
+                                full_path = os.path.realpath(out_fn)
+
+                                out_dir = os.path.dirname(out_fn)
+                                if out_dir and not os.path.exists(out_dir):
+                                    os.makedirs(out_dir, exist_ok=True)
+
+                                try:
+                                    self.download_image(file_url, out_fn,
+                                                        file_size,
+                                                        show_progress=show_progress)
+                                except Exception as e:
+                                    self.log_msg(str(e), 'warning')
+                                    continue
+
+                                print('')
+                                download_paths.append({
+                                    'url': file_url,
+                                    'local_destination': full_path,
+                                })
+                        else:
+                            manifest_fn = os.path.basename(manifest_key) if manifest_key else ''
+                            parsed_url = urlparse(url)
+                            url_fn = os.path.basename(parsed_url.path)
+                            fn = manifest_fn if manifest_fn else url_fn
+                            if not fn:
+                                fn = f"order_item_{cur_item.get('itemId')}"
+
+                            # Download the image
+                            msg = f"Downloading image from Collection {coll_id} " \
+                                  f"with Record Id {record_id} ({fn})."
+                            self.log_msg(msg)
+
+                            # Save the image contents to the 'downloads' folder
+                            out_fn = os.path.join(dest, fn)
+                            full_path = os.path.realpath(out_fn)
+
+                            if not os.path.exists(dest):
+                                os.makedirs(dest, exist_ok=True)
+
+                            try:
+                                self.download_image(url, out_fn, fsize,
+                                                    show_progress=show_progress)
+                            except Exception as e:
+                                self.log_msg(str(e), 'warning')
+                                continue
+
+                            print('')
+
+                            # Record the URL and downloaded file to a dictionary
+                            dest_info = {'url': url, 'local_destination': full_path}
+                            download_paths.append(dest_info)
+
+                    if len(download_paths) > 0:
+                        cur_item['downloaded'] = 'True'
+                    else:
+                        msg = f"No valid download destinations succeeded for " \
+                              f"Order Item Id {cur_item.get('itemId')}"
+                        self.log_msg(msg, 'warning')
 
                     cur_item['downloadPaths'] = download_paths
 
@@ -2315,6 +2472,227 @@ class EODMSRAPI:
             return status_res
         else:
             return res
+
+    def _pick_first(self, rec, keys, default=None):
+        """
+        Returns the first non-empty value from a record for the given keys.
+        """
+
+        if not isinstance(rec, dict):
+            return default
+
+        for key in keys:
+            val = rec.get(key)
+            if val is not None and str(val).strip() != '':
+                return str(val)
+
+        return default
+
+    def extract_destination_url(self, destination):
+        """
+        Extracts a download URL from an order destination object.
+
+        Supported payload shape:
+            {'stringValue': "<a href='https://...'>https://...</a></br>"}
+        """
+
+        if not isinstance(destination, dict):
+            return None
+
+        str_val = destination.get('stringValue')
+        if str_val is None:
+            return None
+
+        str_val = html.unescape(str(str_val)).replace('\\/', '/')
+
+        href_match = re.search(r"href=['\"]([^'\"]+)['\"]", str_val,
+                               flags=re.IGNORECASE)
+        if href_match:
+            return href_match.group(1)
+
+        url_match = re.search(r"https?://[^\s'\"<>]+", str_val,
+                              flags=re.IGNORECASE)
+        if url_match:
+            return url_match.group(0)
+
+        return None
+
+    def collect_order_items(self, payload):
+        """
+        Extracts order items from common RAPI payload shapes.
+        """
+
+        items = []
+
+        if payload is None:
+            return items
+
+        if isinstance(payload, list):
+            for entry in payload:
+                items += self.collect_order_items(entry)
+            return items
+
+        if isinstance(payload, dict):
+            is_item = any(k in payload for k in ('itemId', 'item_id',
+                                                 'orderItemId',
+                                                 'ORDER_ITEM_ID'))
+            if is_item:
+                items.append(payload)
+
+            for key in ('items', 'results', 'orderItems'):
+                val = payload.get(key)
+                if isinstance(val, list):
+                    for entry in val:
+                        items += self.collect_order_items(entry)
+
+        return items
+
+    def summarize_orders(self, payload):
+        """
+        Builds order-level summaries from order or order-item payloads.
+        """
+
+        entries = []
+
+        def _walk(node):
+            if node is None:
+                return
+            if isinstance(node, list):
+                for entry in node:
+                    _walk(entry)
+                return
+            if isinstance(node, dict):
+                has_order_id = any(k in node for k in ('orderId', 'order_id',
+                                                       'ORDER_ID'))
+                if has_order_id:
+                    entries.append(node)
+                for key in ('orders', 'results', 'items', 'orderItems'):
+                    val = node.get(key)
+                    if isinstance(val, list):
+                        for entry in val:
+                            _walk(entry)
+
+        _walk(payload)
+
+        if len(entries) == 0:
+            return []
+
+        grouped = {}
+        for entry in entries:
+            order_id = self._pick_first(entry, ['orderId', 'order_id',
+                                                'ORDER_ID'])
+            if not order_id:
+                continue
+
+            if order_id not in grouped:
+                grouped[order_id] = {
+                    'order_id': order_id,
+                    'status': self._pick_first(entry, ['status', 'STATUS'],
+                                               'N/A'),
+                    'priority': self._pick_first(entry, ['priority',
+                                                         'PRIORITY']),
+                    'submitted': self._pick_first(
+                        entry,
+                        ['submitted', 'dateSubmitted', 'created',
+                         'createdAt']),
+                    'updated': self._pick_first(
+                        entry,
+                        ['updated', 'dateUpdated', 'lastUpdated',
+                         'updatedAt', 'modified']),
+                    'items': 0,
+                    'names': [],
+                    'record_ids': [],
+                    'collections': [],
+                    'destinations': [],
+                }
+
+            summary = grouped[order_id]
+
+            has_item = any(k in entry for k in ('orderItemId', 'itemId',
+                                                'item_id', 'ORDER_ITEM_ID'))
+            if has_item:
+                summary['items'] += 1
+            elif isinstance(entry.get('orderItems'), list):
+                summary['items'] = max(summary['items'],
+                                       len(entry.get('orderItems')))
+
+            if summary.get('status') in (None, '', 'N/A'):
+                summary['status'] = self._pick_first(entry, ['status',
+                                                             'STATUS'],
+                                                     'N/A')
+            if not summary.get('priority'):
+                summary['priority'] = self._pick_first(entry, ['priority',
+                                                               'PRIORITY'])
+            if not summary.get('submitted'):
+                summary['submitted'] = self._pick_first(
+                    entry,
+                    ['submitted', 'dateSubmitted', 'created', 'createdAt'])
+            if not summary.get('updated'):
+                summary['updated'] = self._pick_first(
+                    entry,
+                    ['updated', 'dateUpdated', 'lastUpdated', 'updatedAt',
+                     'modified'])
+
+            name_val = self._pick_first(
+                entry,
+                ['name', 'orderKey', 'order_key', 'ORDER_KEY',
+                 'ARCHIVE_IMAGE.ORDER_KEY'])
+            if name_val and name_val not in summary['names']:
+                summary['names'].append(name_val)
+
+            rec_id = self._pick_first(entry, ['recordId', 'record_id',
+                                              'RECORD_ID'])
+            if rec_id and rec_id not in summary['record_ids']:
+                summary['record_ids'].append(rec_id)
+
+            coll_id = self._pick_first(entry, ['collectionId', 'collection',
+                                               'collection_id'])
+            if coll_id and coll_id not in summary['collections']:
+                summary['collections'].append(coll_id)
+
+            destinations = entry.get('destinations') or []
+            if isinstance(destinations, list):
+                for dest in destinations:
+                    url = self.extract_destination_url(dest)
+                    if url and url not in summary['destinations']:
+                        summary['destinations'].append(url)
+
+        return list(grouped.values())
+
+    def get_order_summaries(self, order_res=None, dtstart=None, dtend=None,
+                            max_orders=100, status=None, out_format='json'):
+        """
+        Retrieves orders and returns normalized order summaries.
+        """
+
+        payload = self.get_orders(order_res=order_res, dtstart=dtstart,
+                                  dtend=dtend, max_orders=max_orders,
+                                  status=status, out_format=out_format)
+        if payload is None:
+            return None
+
+        return self.summarize_orders(payload)
+
+    def list_order_items(self, order_res=None, dtstart=None, dtend=None,
+                         max_orders=100, status=None, out_format='json'):
+        """
+        Retrieves orders and returns normalized item records.
+        """
+
+        payload = self.get_orders(order_res=order_res, dtstart=dtstart,
+                                  dtend=dtend, max_orders=max_orders,
+                                  status=None, out_format=out_format)
+        if payload is None:
+            return None
+
+        items = self.collect_order_items(payload)
+
+        if status is not None:
+            target = str(status).upper()
+            items = [i for i in items
+                     if str(i.get('status', '')).upper() == target]
+
+        return items
 
     def get_orders_by_records(self, records):
         """

@@ -193,7 +193,7 @@ class EODMSGeo:
         :rtype: str
         """
 
-        numbers = re.findall("\d+\.\d+", in_wkt)
+        numbers = re.findall(r"\d+\.\d+", in_wkt)
 
         out_wkt = in_wkt
         for num in numbers:
