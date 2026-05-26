@@ -1,47 +1,29 @@
 ##############################################################################
-# MIT License
-# 
+#
 # Copyright (c) His Majesty the King in Right of Canada, as
-# represented by the Minister of Natural Resources, 2022
+# represented by the Minister of Natural Resources, 2025
 # 
-# Permission is hereby granted, free of charge, to any person obtaining a 
-# copy of this software and associated documentation files (the "Software"), 
-# to deal in the Software without restriction, including without limitation 
-# the rights to use, copy, modify, merge, publish, distribute, sublicense, 
-# and/or sell copies of the Software, and to permit persons to whom the 
-# Software is furnished to do so, subject to the following conditions:
-# 
-# The above copyright notice and this permission notice shall be included in 
-# all copies or substantial portions of the Software.
-# 
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING 
-# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER 
-# DEALINGS IN THE SOFTWARE.
+# Licensed under the MIT license
+# (see LICENSE or <http://opensource.org/licenses/MIT>) All files in the 
+# project carrying such notice may not be copied, modified, or distributed 
+# except according to those terms.
 # 
 ##############################################################################
-
-
 
 import os
 import html
 # import sys
 import requests
-# import logging
 import logging.config
 import traceback
 import urllib
 import json
-# import csv
-import datetime
+from datetime import datetime, timedelta, timezone
 import pytz
 import time
-# import pprint
 import dateparser
 import re
+from lxml import html, etree
 import dateutil.parser
 from dateutil.tz import tzlocal
 from urllib.parse import urlencode, urlparse, parse_qsl, urlunparse, quote
@@ -53,6 +35,9 @@ from warnings import warn
 from tqdm.auto import tqdm
 
 from .geo import EODMSGeo
+from .rapi_requests import RAPIRequests
+from .query_error import QueryError
+from .__version__ import __version__
 
 OTHER_FORMAT = '| %(name)s | %(levelname)s: %(message)s', '%Y-%m-%d %H:%M:%S'
 
@@ -73,56 +58,12 @@ RECORD_KEYS = ["recordId", "overviewUrl", "collectionId", "metadata2",
                "metadata"]
 
 
-class QueryError:
-    """
-    The QueryError class is used to store error information for a query.
-    """
-
-    def __init__(self, msgs):
-        """
-        Initializer for QueryError object which stores an error message.
-        
-        :param msgs: The error message to print.
-        :type  msgs: str
-        """
-
-        self.msgs = msgs
-
-    def get_msgs(self, as_str=False):
-        """
-        Gets the messages stored with the QueryError.
-        
-        :param as_str: Determines whether to return a string or a list of
-        messages.
-        :type  as_str: boolean
-        
-        :return: Either a string or a list of messages.
-        :rtype: str or list
-        """
-
-        if isinstance(self.msgs, list):
-            if as_str:
-                return ' '.join(filter(None, self.msgs))
-
-        return self.msgs
-
-    def _set_msgs(self, msgs):
-        """
-        Sets the messages stored with the QueryError.
-        
-        :param msgs: Can either be a string or a list of messages.
-        :type  msgs: str or list
-        
-        """
-        self.msgs = msgs
-
-
 class EODMSRAPI:
     """
     The EODMSRAPI Class containing the methods for the eodms_rapi
     """
 
-    def __init__(self, username, password, show_timestamp=True):
+    def __init__(self, username=None, password=None, show_timestamp=True):
         """
         Initializer for EODMSRAPI.
         
@@ -136,8 +77,8 @@ class EODMSRAPI:
 
         # Create session
         self.collection = None
-        self._session = requests.Session()
-        self._session.auth = (username, password)
+        # self._session = requests.Session()
+        # self._session.auth = (username, password)
         self._email = 'eodms-sgdot@nrcan-rncan.gc.ca'
 
         self.rapi_root = "https://www.eodms-sgdot.nrcan-rncan.gc.ca/wes/rapi"
@@ -149,7 +90,7 @@ class EODMSRAPI:
         self.results = []
         self.search_results = None
         self.res_mdata = None
-        self.limit_interval = 1000
+        # self.limit_interval = 1000
         self.name_conv = 'camel'
         self.res_format = 'raw'
         self.stdout_enabled = True
@@ -162,20 +103,27 @@ class EODMSRAPI:
         self.dates = None
         self.feats = None
         self.max_results = None
-        self._rapi_url = None
-        self.start = datetime.datetime.now()
+        self.rapi_url = None
+        self.start = datetime.now()
         self.logger = logger
         self.err_occurred = False
         self.auth_err = False
         self.err_msg = None
-        self.order_json = None
+        self.order_info = None
         self.show_timestamp = show_timestamp
+        self.msg = ''
+        self.search_params = {}
+
+        self.rapi_session = RAPIRequests(self, username, password)
+        self.rapi_session.add_header('User-Agent', 
+                                      f'py-eodms-rapi/{__version__}', 
+                                      True)
 
         self.geo = EODMSGeo(self)
 
         # self._map_fields()
 
-        self._header = '| EODMSRAPI | '
+        self.header = '| EODMSRAPI | '
 
         self.failed_status = ['CANCELLED', 'FAILED', 'EXPIRED',
                               'DELIVERED', 'MEDIA_ORDER_SUBMITTED',
@@ -200,7 +148,8 @@ class EODMSRAPI:
                          'SATOPT.CLOUD_PERCENT', 'SATOPT.SENS_INC'],
             'GeoEye-1': ['ARCHIVE_IMAGE.ORDER_KEY',
                          'SENSOR_BEAM.SPATIAL_RESOLUTION',
-                         'GE1.CLOUD_PERCENT', 'GE1.SENS_INC'],
+                         'GE1.CLOUD_PERCENT', 'GE1.SENS_INC', 
+                         'GE1.SBEAM'],
             'IKONOS': ['ARCHIVE_IMAGE.ORDER_KEY',
                        'SENSOR_BEAM.SPATIAL_RESOLUTION',
                        'IKONOS.CLOUD_PERCENT', 'IKONOS.SENS_INC',
@@ -347,24 +296,45 @@ class EODMSRAPI:
 
     ###############################################################
 
-    def _check_complete(self, complete_items, record_id):
+    # def _check_complete(self, complete_items, record_id):
+    #     """
+    #     Checks if an order item has already been downloaded.
+
+    #     :param complete_items: A list of completed order items.
+    #     :type  complete_items: list
+    #     :param record_id: The record ID of the image.
+    #     :type  record_id: int
+
+    #     :return: True if already downloaded, False if not.
+    #     :rtype: boolean
+    #     """
+
+    #     return any(i['recordId'] == record_id for i in complete_items)
+
+    def _check_complete(self, complete_items, item_id, record_id):
         """
         Checks if an order item has already been downloaded.
 
         :param complete_items: A list of completed order items.
-        :type  complete_items: list
+        :type  complete_items: list[dict]
+        :param item_id: The Order Item ID of the image.
+        :type  item_id: int
         :param record_id: The record ID of the image.
         :type  record_id: int
 
         :return: True if already downloaded, False if not.
-        :rtype: boolean
+        :rtype: bool
         """
 
-        for i in complete_items:
-            if i['recordId'] == record_id:
-                return True
+        # print(f"complete_items: {complete_items}")
 
-        return False
+        # complete_item_all = [i['itemId'] for i in complete_items]
+        complete_item_ids = [i['itemId'] for i in complete_items 
+                             if str(i['recordId']) == str(record_id)]
+        parent_ids = [i.get('parameters').get('ParentItemId') 
+                      for i in complete_items]
+
+        return item_id in complete_item_ids or item_id in parent_ids
 
     def _check_auth(self, in_err=None):
         """
@@ -378,8 +348,8 @@ class EODMSRAPI:
         """
 
         if in_err is None:
-            query_url = f"{self.rapi_root}/collections?format=json"
-            coll_res = self._submit(query_url, timeout=20.0)
+            self.rapi_url = f"{self.rapi_root}/collections?format=json"
+            coll_res = self.rapi_session.submit(self.rapi_url, timeout=20.0)
 
             # print(f"coll_res: {coll_res}")
             if isinstance(coll_res, QueryError):
@@ -413,7 +383,7 @@ class EODMSRAPI:
         :param date: The input date to convert.
         :type  date: str or datetime.datetime
         :param in_forms: Specifies the input formats of the date.
-        :type  in_forms: list
+        :type  in_forms: list[str]
         :param out: The type of output date, either 'string' or 'date'
                     (i.e. datetime.datetime)
         :type  out: str
@@ -426,12 +396,9 @@ class EODMSRAPI:
 
         if in_forms is None:
             in_forms = ['%Y-%m-%d %H:%M:%S.%f']
-        if isinstance(date, datetime.datetime):
-            if out_form == 'iso':
-                return date.isoformat()
-            else:
-                return date.strftime(out_form)
-
+        if isinstance(date, datetime):
+            return date.isoformat() if out_form == 'iso' \
+                        else date.strftime(out_form)
         elif isinstance(date, str):
 
             if isinstance(in_forms, str):
@@ -439,21 +406,17 @@ class EODMSRAPI:
 
             for form in in_forms:
                 try:
-                    out_date = datetime.datetime.strptime(date, form)
-                    if out == 'date':
-                        return out_date
-                    else:
-                        return out_date.strftime(out_form)
+                    out_date = datetime.strptime(date, form)
+                    return out_date if out == 'date' \
+                            else out_date.strftime(out_form)
                 except ValueError as e:
-                    msg = f"{str(e).capitalize()}. Date will not be included " \
-                          f"in query."
+                    self.msg = f"{str(e).capitalize()}. Date will not be " \
+                                    f"included in query."
 
-                    self.log_msg(msg, 'warning')
-                    pass
+                    self.log_msg(self.msg, 'warning')
                 except Exception:
-                    msg = traceback.format_exc()
-                    self.log_msg(msg, 'warning')
-                    pass
+                    self.msg = traceback.format_exc()
+                    self.log_msg(self.msg, 'warning')
 
     def _convert_field(self, field, collection, field_type='search'):
         """
@@ -479,6 +442,13 @@ class EODMSRAPI:
                 return v['id']
             elif field == v['id']:
                 return k
+    
+    def close_session(self):
+        """
+        Logs out of the EODMS RAPI
+        """
+        
+        self.rapi_session.close_session()
 
     def get_conv(self, field):
         """
@@ -492,26 +462,25 @@ class EODMSRAPI:
         :rtype: str
         """
 
-        if self.name_conv == 'words' or self.name_conv == 'upper':
-            # Remove bracketted string for 'upper'
-            if self.name_conv == 'upper':
-                field = re.sub(r"\([^()]*\)", "", field)
-                field = field.strip()
-
-            # Separate into words
-            if field.find(' ') > -1:
-                words = field.split(' ')
-            else:
-                words = re.findall('.+?(?:(?<=[a-z])(?=[A-Z])|(?<='
-                                   '[A-Z])(?=[A-Z][a-z])|$)', field)
-                words = [w[0].upper() + w[1:] for w in words]
-
-            if self.name_conv == 'words':
-                return ' '.join(words)
-            elif self.name_conv == 'upper':
-                return '_'.join([w.upper() for w in words])
-        else:
+        if self.name_conv not in ['words', 'upper']:
             return self._to_camel_case(field)
+        # Remove bracketted string for 'upper'
+        if self.name_conv == 'upper':
+            field = re.sub(r"\([^()]*\)", "", field)
+            field = field.strip()
+
+        # Separate into words
+        if field.find(' ') > -1:
+            words = field.split(' ')
+        else:
+            words = re.findall('.+?(?:(?<=[a-z])(?=[A-Z])|(?<='
+                               '[A-Z])(?=[A-Z][a-z])|$)', field)
+            words = [w[0].upper() + w[1:] for w in words]
+
+        if self.name_conv == 'words':
+            return ' '.join(words)
+        elif self.name_conv == 'upper':
+            return '_'.join([w.upper() for w in words])
 
     def _fetch_metadata(self, max_workers=4, len_timeout=20.0,
                         show_progress=True):
@@ -533,14 +502,14 @@ class EODMSRAPI:
 
         :return: A list containing the metadata for all items in the
         self.results
-        :rtype:  list
+        :rtype:  list[dict]
         """
 
         metadata_fields = self._get_meta_keys()
 
         if isinstance(metadata_fields, QueryError):
-            msg = "Could not generate metadata for the results."
-            self.log_msg(msg, 'warning')
+            self.msg = "Could not generate metadata for the results."
+            self.log_msg(self.msg, 'warning')
             return None
 
         if isinstance(self.results, dict):
@@ -556,7 +525,7 @@ class EODMSRAPI:
                             self.results,
                             [len_timeout] * n_urls,
                         ),
-                        desc=f'{self._header}Fetching result metadata',
+                        desc=f'{self.header}Fetching result metadata',
                         total=n_urls,
                         miniters=1,
                         unit='item'
@@ -570,7 +539,7 @@ class EODMSRAPI:
 
         return out_results
 
-    def _fetch_single_record_metadata(self, record, timeout):  # , keys):
+    def _fetch_single_record_metadata(self, record, timeout):    # , keys):
         """
         Fetches a single image's metadata.
 
@@ -588,14 +557,14 @@ class EODMSRAPI:
         """
 
         record_url = f"{record['thisRecordUrl']}?format=json"
-        r = self._submit(record_url, timeout=timeout, as_json=False)
+        r = self.rapi_session.submit(record_url, timeout=timeout, as_json=False)
 
         if r is None or self.err_occurred:
             return None
 
         if isinstance(r, QueryError):
             err_msg = f"Could not retrieve full metadata due to: " \
-                      f"{r.get_msgs(True)}"
+                          f"{r.get_msgs(True)}"
             self.log_msg(err_msg, 'warning')
             record['issue'] = err_msg
             image_res = record
@@ -606,16 +575,14 @@ class EODMSRAPI:
             self.log_msg(err_msg, 'warning')
             image_res = record
 
-        metadata = self.parse_metadata(image_res)  # , keys)
-
-        return metadata
+        return self.parse_metadata(image_res)
 
     def _get_date_range(self, items):
         """
         Gets the date range for a list of items (images).
 
         :param items: A list of items.
-        :type  items: list
+        :type  items: list[dict]
 
         :return: A tuple with the start and end date of the range.
         :rtype: tuple
@@ -643,10 +610,10 @@ class EODMSRAPI:
         dates.sort()
 
         start = dates[0]
-        start = start - datetime.timedelta(hours=0, minutes=1)
+        start = start - timedelta(hours=0, minutes=1)
 
-        end = dates[len(dates) - 1]
-        end = end + datetime.timedelta(hours=0, minutes=1)
+        end = dates[-1]
+        end = end + timedelta(hours=0, minutes=1)
 
         return start, end
 
@@ -655,7 +622,7 @@ class EODMSRAPI:
         Gets a list of metadata (fields) keys for a given collection
 
         :return: A list of metadata keys
-        :rtype:  list
+        :rtype:  list[str]
         """
 
         if not self.rapi_collections:
@@ -665,10 +632,8 @@ class EODMSRAPI:
             return None
 
         fields = self.rapi_collections[self.collection]['fields']['results']. \
-            keys()
-        sorted_lst = sorted(fields)
-
-        return sorted_lst
+                keys()
+        return sorted(fields)
 
     def _get_exception(self, res, output='str'):
         """
@@ -701,25 +666,17 @@ class EODMSRAPI:
         # If the input is a string, convert it to a
         #   xml.etree.ElementTree.Element
         # print(f"in_str: {in_str}")
-        if isinstance(in_str, str):
-            root = ElementTree.fromstring(in_str)
-        else:
-            root = in_str
-
+        root = ElementTree.fromstring(in_str) \
+                        if isinstance(in_str, str) else in_str
         # Cycle through the input XML and location the ExceptionText element
         out_except = []
         for child in root.iter('*'):
             if child.tag.find('ExceptionText') > -1:
-                if output == 'tree':
-                    return child
-                else:
-                    return child.text
+                return child if output == 'tree' else child.text
             elif child.tag.find('p') > -1:
                 out_except.append(child.text)
 
-        query_err = QueryError(out_except)
-
-        return query_err
+        return QueryError(out_except)
 
     def _get_field_id(self, name, field_type='search'):
         """
@@ -809,7 +766,7 @@ class EODMSRAPI:
         :param item_id: The order item ID.
         :type  item_id: int
         :param orders: A list of order items.
-        :type  orders: list
+        :type  orders: list[dict]
 
         :return: The specific order with the given order item ID.
         :rtype: dict
@@ -822,6 +779,21 @@ class EODMSRAPI:
                         return o
             if str(o['itemId']) == str(item_id):
                 return o
+
+    def _phrase_to_date(self, in_date):
+        """
+        Converts a date phrase to a date format for the RAPI.
+
+        :param in_date: The date phrase to convert.
+        :type  in_date: str
+        """
+
+        if isinstance(in_date, datetime):
+            return in_date
+        elif isinstance(in_date, str):
+            return dateparser.parse(in_date)
+        else:
+            return None
 
     def is_json(self, my_json):
         """
@@ -840,47 +812,47 @@ class EODMSRAPI:
             return False
         return True
 
-    def _build_or(self, field_id, op, values, d_type):
+    def get_metadata(self):
         """
-        Builds an 'OR' statement for the query to the RAPI.
+        Gets the metadata of the current user.
 
-        :param field_id: The field ID for the OR statements.
-        :type  field_id: str
-        :param op: The operator for the OR statements.
-        :type  op: str
-        :param values: A list of values for the OR statements.
-        :type  values: list
-        :param d_type: The data type of the values ('String' or something
-                        else).
-        :type  d_type: str
-
-        :return: The complete OR statement for the list of values.
-        :rtype: str
+        :return: The metadata of the current user.
+        :rtype: dict
         """
+
+        metadata_url = f"{self.rapi_root}/metadata?format=json"
+        metadata = self.rapi_session.submit(metadata_url)
+        return metadata
+
+    def _create_expr(self, field_id, op, value, d_type):
+
+        choices = self.get_field_choices(self.collection, field_id)
 
         if d_type == 'String':
-            or_query = '%s' % ' OR '.join([f"{field_id}{op}'{v}'"
-                                           for v in values])
+            # For data types which are strings
+            return f"{field_id}{op}'{value}'"
+        elif d_type == 'Boolean':
+            if value.lower() in choices:
+                return f"{field_id}{op}'{value}'"
+            elif str(value).lower().find('t') > -1 \
+                    or str(value).lower().find('y') > -1:
+                return f"{field_id}{op}true"
+            elif str(val[0]).lower().find('f') > -1 \
+                    or str(value).lower().find('n') > -1:
+                return f"{field_id}{op}false"
         elif d_type == 'DateTimeRange':
-            date_vals = []
-            for val in values:
-                date = dateutil.parser.parse(val)
-                iso_date = date.isoformat()
-                date_vals.append(iso_date)
-            or_query = '%s' % ' OR '.join([f"{field_id}{op}'{v}'"
-                                           for v in date_vals])
+            date = dateutil.parser.parse(value)
+            iso_date = date.isoformat()
+            return f"{field_id}{op}'{iso_date}'"
         else:
-            or_query = '%s' % ' OR '.join([f"{field_id}{op}{v}"
-                                           for v in values])
-
-        return or_query
+            return f"{field_id}{op}{value}"
 
     def log_msg(self, messages, msg_type='info', log_indent='', out_indent=''):
         """
         Logs a message to the logger.
 
         :param messages: Either a single message or a list of messages to log.
-        :type  messages: str or list
+        :type  messages: str or list[str]
         :param msg_type: The type of log ('debug', 'info', 'warning',
                         'error', etc.)
         :type  msg_type: str
@@ -892,12 +864,13 @@ class EODMSRAPI:
         :type  out_indent: str
         """
 
-        if isinstance(messages, list) or isinstance(messages, tuple):
+        if isinstance(messages, (list, tuple)):
             log_msg, out_msg = messages
         elif isinstance(messages, str):
             log_msg = out_msg = messages
         else:
-            print("EODMSRAPI.log_msg: 'messages' parameter not valid.")
+            traceback.print_exc()
+            # print("EODMSRAPI.log_msg: 'messages' parameter not valid.")
             return None
 
         # Log the message
@@ -913,17 +886,17 @@ class EODMSRAPI:
 
         # Set timestamp
         if self.show_timestamp:
-            current_time = datetime.datetime.now()
+            current_time = datetime.now()
             timestamp = f"{current_time.strftime('%Y-%m-%d %H:%M:%S')} | "
         else:
             timestamp = ''
 
         # Print message to terminal
         if msg_type == 'info':
-            msg = f"{out_indent}{self._header}{timestamp}{out_msg}"
+            msg = f"{out_indent}{self.header}{timestamp}{out_msg}"
         else:
-            msg = f"{out_indent}{self._header}{timestamp} " \
-                  f"{msg_type.upper()}: {out_msg}"
+            msg = f"{out_indent}{self.header}{timestamp} " \
+                      f"{msg_type.upper()}: {out_msg}"
 
         print(msg)
 
@@ -932,14 +905,14 @@ class EODMSRAPI:
         Orders the metadata keys of RAPI results.
 
         :param results:
-        :type  results: list
+        :type  results: list[dict]
         :param keys: A list of keys in the proper order (the list does not
                     have to contain all the keys, all remaining keys will
                     appear in their original order).
-        :type  keys: list
+        :type  keys: list[str]
 
         :return: The results in the specified order.
-        :rtype: list
+        :rtype: list[dict]
         """
 
         out_results = []
@@ -1042,7 +1015,7 @@ class EODMSRAPI:
             return None
 
         # Build the query for the date range
-        if dates is not None and not str(dates).strip() == '':
+        if dates is not None and str(dates).strip():
             self.dates = dates
 
         if self.dates is not None:
@@ -1063,11 +1036,8 @@ class EODMSRAPI:
                 start = None
                 end = None
                 if isinstance(rng, str):
-                    time_words = ['hour', 'day', 'week', 'month', 'year']
-
-                    if any(word in rng for word in time_words):
-                        start = dateparser.parse(rng).strftime("%Y%m%d_%H%M%S")
-                        end = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                    start = dateparser.parse(rng).strftime("%Y%m%d_%H%M%S")
+                    end = datetime.now().strftime("%Y%m%d_%H%M%S")
                 else:
                     if 'start' not in rng.keys():
                         break
@@ -1084,7 +1054,7 @@ class EODMSRAPI:
                 date_queries.append(f"{field_id}>='{start}' AND "
                                     f"{field_id}<='{end}'")
 
-            if len(date_queries) > 0:
+            if date_queries:
                 query_lst.append(f"({' OR '.join(date_queries)})")
 
         # Build the query for the geometry features
@@ -1095,6 +1065,9 @@ class EODMSRAPI:
 
             geom_lst = []
 
+            if not isinstance(feats, list):
+                feats = [feats]
+
             for idx, f in enumerate(feats):
                 op = f[0].upper()
                 src = f[1]
@@ -1102,9 +1075,9 @@ class EODMSRAPI:
                 self.geoms = self.geo.add_geom(src)
 
                 if self.geoms is None or isinstance(self.geoms, SyntaxError):
-                    msg = f"Geometry feature #{str(idx + 1)} could not be " \
-                          f"determined. Excluding it from search."
-                    self.log_msg(msg, 'warning')
+                    self.msg = f"Geometry feature #{str(idx + 1)} could " \
+                                f"not be determined. Excluding it from search."
+                    self.log_msg(self.msg, 'warning')
                 else:
                     field_id = self._get_field_id('Footprint')
 
@@ -1112,7 +1085,7 @@ class EODMSRAPI:
                         return None
 
                     self.geoms = [self.geoms] \
-                        if not isinstance(self.geoms, list) else self.geoms
+                            if not isinstance(self.geoms, list) else self.geoms
 
                     for g in self.geoms:
                         if op == '=':
@@ -1120,12 +1093,15 @@ class EODMSRAPI:
                         else:
                             geom_lst.append(f'{field_id} {op} {g}')
 
-            if len(geom_lst) > 0:
+            if geom_lst:
                 query_lst.append(f"({' OR '.join(geom_lst)})")
 
         # Build the query containing the filters
         if filters is not None:
             for field, values in filters.items():
+
+                # print(f"field: {field}")
+                # print(f"values: {values}")
 
                 field_id = self._get_field_id(field)
 
@@ -1133,107 +1109,133 @@ class EODMSRAPI:
                     return None
 
                 if field_id is None:
-                    msg = f"No available field named '{field}'."
-                    self.log_msg(msg, 'warning')
+                    self.msg = f"No available field named '{field}'."
+                    self.log_msg(self.msg, 'warning')
                     continue
 
                 d_type = self._get_field_type(self.collection, field_id)
 
                 # print("d_type: %s" % d_type)
 
-                op = values[0]
-                val = values[1]
+                # if not isinstance(values, list):
+                #     values = [values]
 
-                if not any(c in op for c in '=><'):
-                    op = ' %s ' % op
+                if len(values) == 0:
+                    self.msg = f"No value given for field named '{field}'."
+                    self.log_msg(self.msg, 'warning')
+                    continue
+                elif len(values) == 1:
+                    op = '='
+                    val = values[0]
+                else:
+                    op = values[0]
+                    val = values[1]
 
-                if field == 'Incidence Angle' or field == 'Scale' or \
-                        field == 'Spacial Resolution' or \
-                        field == 'Absolute Orbit':
-                    if isinstance(val, list) or isinstance(val, tuple):
-                        for v in val:
-                            if v.find('-') > -1:
-                                start, end = v.split('-')
-                                val_query = self._parse_range(field_id, start,
-                                                              end)
-                            else:
-                                val_query = f"{field_id}{op}{v}"
-                            query_lst.append(val_query)
-                        continue
-                    else:
-                        if str(val).find('-') > -1:
-                            start, end = str(val).split('-')
-                            val_query = self._parse_range(field_id, start, end)
+                if val is None or val == '': continue
+
+                if all(c not in op for c in '=><'):
+                    op = f' {op} '
+
+                if not isinstance(val, list) and not isinstance(val, tuple):
+                    val = [val]
+
+                if field in [
+                    'Incidence Angle',
+                    'Scale',
+                    'Spacial Resolution',
+                    'Absolute Orbit',
+                ]:
+
+                    for v in val:
+                        if str(v).find('-') > -1:
+                            start, end = v.split('-')
+                            val_query = self._parse_range(field_id, start,
+                                                            end)
                         else:
-                            val_query = f"{field_id}{op}{val}"
+                            val_query = f"{field_id}{op}{v}"
+                        query_lst.append(val_query)
+                    continue
+                    # else:
+                    #     if str(val).find('-') > -1:
+                    #         start, end = str(val).split('-')
+                    #         val_query = self._parse_range(field_id, start, end)
+                    #     else:
+                    #         val_query = f"{field_id}{op}{val}"
+
+                elif field_id == 'RCM.SPECIAL_HANDLING_REQUIRED':
+                    val_query = f"{field_id}{op}{val[0]}"
+
                 elif field == 'Footprint':
 
                     pnts = []
-                    vals = val.split(' ')
-                    for idx in range(0, len(vals), 2):
-                        if vals[idx].strip() == '':
-                            continue
-
-                        pnts.append((float(vals[idx]), float(vals[idx + 1])))
-
+                    vals = val[0].split(' ')
+                    pnts.extend(
+                        (float(vals[idx]), float(vals[idx + 1]))
+                        for idx in range(0, len(vals), 2)
+                        if vals[idx].strip() != ''
+                    )
                     self.geoms = self.geo.add_geom(pnts)
 
                     val_query = f"{field_id}{op}{self.geoms}"
 
                 else:
-                    if isinstance(val, list) or isinstance(val, tuple):
-                        val_query = self._build_or(field_id, op, val, d_type)
-                    else:
-                        if d_type == 'String':
-                            val_query = f"{field_id}{op}'{val}'"
-                        elif d_type == 'DateTimeRange':
-                            date = dateutil.parser.parse(val)
-                            iso_date = date.isoformat()
-                            val_query = f"{field_id}{op}'{iso_date}'"
-                        else:
-                            val_query = f"{field_id}{op}{val}"
+                    # Convert choice to value
+                    choices = self.get_field_choices(self.collection, 
+                                                     field_id, True)
+                    valid_vals = []
+                    for v in val:
+                        new_val = None
+                        for c in choices:
+                            if isinstance(c, dict):
+                                if c.get('label') == v:
+                                    new_val = c.get('value')
+                                    valid_vals.append(new_val)
+                                    break
+                        if not new_val:
+                            valid_vals.append(v)
 
+                    val = valid_vals
+
+                    if len(val) > 1:
+                        # Combine multiple values together
+                        # val_query = self._build_or(field_id, op, val, d_type)
+                        val_query = '%s' % ' OR '.join([self._create_expr(field_id, op, v, 
+                                                             d_type)
+                                           for v in val if not v == ''])
+                    else:
+                        val_query = self._create_expr(field_id, op, val[0], 
+                                                      d_type)
+                
                 query_lst.append(val_query)
 
+        # print(f"query_lst: {query_lst}")
+
         if len(query_lst) > 1:
-            query_lst = ['(%s)' % q if q.find(' OR ') > -1 else q
-                         for q in query_lst]
+            query_lst = [f'({q})' if q.find(' OR ') > -1 else q for q in query_lst]
+            # print(f"query_lst: {query_lst}")
 
-        full_query = ' AND '.join(query_lst)
+        return ' AND '.join(query_lst)
 
-        return full_query
-
-    def _submit_search(self):
+    def _submit_search(self, show_log=True):
         """
         Submit a search query to the desired EODMS collection
-
-        Since there may be instances where the default maxResults is greater
-        than 150, this method should recursively call itself until the
-        correct number of results is retrieved.
-
-        (Adapted from: eodms-api-client (
-        https://pypi.org/project/eodms-api-client/) developed by Mike Brady)
 
         :return: The search-query response JSON from the EODMS REST API.
         :rtype:  json
         """
 
-        # If max_results is specified, reduce the number of records in
-        #   search_results to max_results and then return the search_results
-        if self.max_results is not None:
-            if len(self.search_results) >= self.max_results:
-                self.search_results = self.search_results[:self.max_results]
-                return self.search_results
+        if show_log:
+            msg = f"Querying records..."
+            self.log_msg(msg)
 
-        # Print status of search
-        start = len(self.search_results) + 1
-        end = len(self.search_results) + self.limit_interval
+        # logger.debug(f"RAPI Query URL: {self.rapi_url}")
+        if show_log:
+            self.log_msg(f"RAPI Query URL: {self.rapi_url}")
+        r = self.rapi_session.submit(self.rapi_url)
 
-        msg = f"Querying records within {start} to {end}..."
-        self.log_msg(msg)
-
-        logger.debug(f"RAPI Query URL: {self._rapi_url}")
-        r = self._submit(self._rapi_url)
+        if self.search_params.get('hitCount'):
+            # print(f"r: {r.json()}")
+            return r #.json() if isinstance(r, requests.Response) else r
 
         # If a fatal error occurred
         if r is None or self.err_occurred:
@@ -1243,7 +1245,7 @@ class EODMSRAPI:
         if isinstance(r, QueryError):
             err_msg = r.get_msgs(True)
 
-            out_msg = self._check_http(err_msg)
+            out_msg = self.rapi_session.check_http(err_msg)
             if out_msg is not None:
                 self.log_msg(out_msg, 'warning')
                 self.search_results = r
@@ -1255,268 +1257,10 @@ class EODMSRAPI:
             return self._submit_search()
 
         # If applicable, convert results to JSON
-        if isinstance(r, requests.Response):
-            data = r.json()
-        else:
-            data = r
-
-        # Get the total number of results
-        tot_results = int(data['totalResults'])
-
-        # If there are no results, no need to go further
-        if tot_results == 0:
-            return self.search_results
-
-        # If the number of results has hit the limit_interval, return results
-        elif tot_results < self.limit_interval:
-            self.search_results += data['results']
-            return self.search_results
-
-        # Append firstResult to the URL query and run _submit_search method
-        #   again
-        self.search_results += data['results']
-        first_result = len(self.search_results) + 1
-        if self._rapi_url.find('&firstResult') > -1:
-            old_first_result = int(re.search(
-                r'&firstResult=([\d*]+)',
-                self._rapi_url
-            ).group(1))
-            self._rapi_url = self._rapi_url.replace(
-                '&firstResult=%d' % old_first_result,
-                '&firstResult=%d' % first_result
-            )
-        else:
-            self._rapi_url += f'&firstResult={first_result}'
-
-        return self._submit_search()
-
-    def _check_http(self, err_msg):
-        """
-        Checks an error message for the HTTP code and returns a more
-        appropriate message.
-
-        :param err_msg: The error message from the response.
-        :type  err_msg: str
-
-        :return: The new error message (or None is no error).
-        :rtype: str (or None)
-        """
-
-        if err_msg.find('404 Client Error') > -1 or \
-            err_msg.find('404 for url') > -1:
-            msg = f"404 Client Error: Could not find {self._rapi_url}."
-        elif err_msg.find('400 Client Error') > -1:
-            msg = f"400 Client Error: A Bad Request occurred while trying to " \
-                  f"reach {self._rapi_url}"
-        elif err_msg.find('500 Server Error') > -1:
-            msg = f"500 Server Error: An internal server error has occurred " \
-                  f"while to access {self._rapi_url}"
-        elif err_msg.find('401 Client Error') > -1:
-            return err_msg
-        else:
-            return None
-
-        return msg
-
-    def _submit(self, query_url, request_type='get', post_data=None,
-                timeout=None, record_name=None, quiet=True, as_json=True):
-        """
-        Send a query to the RAPI.
-
-        :param query_url: The query URL.
-        :type  query_url: str
-        :param timeout: The length of the timeout in seconds.
-        :type  timeout: float
-        :param record_name: A string used to supply information for the record
-                            in a print statement.
-        :type  record_name: str
-        :param quiet: Determines whether to ignore log printing.
-        :type  quiet: bool
-        :param as_json: Determines whether to return results in JSON format.
-        :type  as_json: bool
-
-        :return: The response returned from the RAPI.
-        :rtype: request.Response
-        """
-
-        if timeout is None:
-            timeout = self.timeout_query
-
-        logger.debug(f"RAPI Query URL: {query_url}")
-
-        res = None
-        attempt = 1
-        err = None
-        msg = ''
-        # Get the entry records from the RAPI using the downlink segment ID
-        while res is None and attempt <= self.attempts:
-            # Continue to attempt if timeout occurs
-            try:
-                if record_name is None:
-                    msg = f"Sending request to the RAPI (attempt {attempt})..."
-                    if not quiet and attempt > 1:
-                        logger.debug(f"\n{self._header}{msg}")
-                else:
-                    msg = f"Sending request to the RAPI for '{record_name}' " \
-                          f"(attempt {attempt})..."
-                    if not quiet and attempt > 1:
-                        logger.debug(f"\n{self._header}{msg}")
-                if self._session is None:
-                    if request_type.lower() == 'post':
-                        res = requests.post(query_url, post_data,
-                                            timeout=timeout, verify=self.verify)
-                    elif request_type.lower() == 'put':
-                        res = requests.put(url=query_url,
-                                           timeout=timeout,
-                                           verify=self.verify)
-                    elif request_type.lower() == 'delete':
-                        res = requests.delete(url=query_url,
-                                              timeout=timeout,
-                                              verify=self.verify)
-                    else:
-                        res = requests.get(query_url, timeout=timeout,
-                                           verify=self.verify)
-                else:
-                    if request_type.lower() == 'post':
-                        res = self._session.post(query_url, post_data,
-                                                 timeout=timeout,
-                                                 verify=self.verify)
-                    elif request_type.lower() == 'put':
-                        res = self._session.put(url=query_url,
-                                                timeout=timeout,
-                                                verify=self.verify)
-                    elif request_type.lower() == 'delete':
-                        res = self._session.delete(url=query_url,
-                                                   timeout=timeout,
-                                                   verify=self.verify)
-                    else:
-                        res = self._session.get(query_url, timeout=timeout,
-                                                verify=self.verify)
-                res.raise_for_status()
-            except requests.exceptions.HTTPError as errh:
-                msg = f"HTTP Error: {errh}"
-
-                out_msg = self._check_http(msg)
-
-                if out_msg is not None:
-                    err = out_msg
-                    query_err = QueryError(err)
-
-                    if self._check_auth(query_err):
-                        return query_err
-
-                    return query_err
-
-                # elif msg.find('400 Client Error') > -1:
-                #     query_err = self._get_exception(res)
-                #
-                #     if self._check_auth(query_err):
-                #         return err
-                #
-                #     return query_err
-                # elif msg.find('500 Server Error') > -1:
-                #     query_err = self._get_exception(res)
-                #     # err = msg
-                #     # query_err = QueryError(err)
-                #
-                #     if self._check_auth(query_err):
-                #         return err
-                #
-                #     return query_err
-
-                if attempt < self.attempts:
-                    msg = f"{msg}; attempting to connect again..."
-                    self.log_msg(msg, 'warning')
-                    res = None
-                else:
-                    err = msg
-                attempt += 1
-            except requests.exceptions.SSLError as ssl_err:
-                msg = f"SSL Error: {ssl_err}"
-                if attempt < self.attempts:
-                    msg = f"{msg}; removing SSL verification and attempting " \
-                          f"to connect again..."
-                    self.log_msg(msg, 'warning')
-                    res = None
-                    self.verify = False
-                else:
-                    err = msg
-                attempt += 1
-            except (requests.exceptions.Timeout,
-                    requests.exceptions.ReadTimeout) as errt:
-                msg = f"Timeout Error: {errt}"
-                if attempt < self.attempts:
-                    msg = f"{msg}; increasing timeout by a minute and " \
-                          f"trying again..."
-                    self.log_msg(msg, 'warning')
-                    res = None
-                    timeout += 60.0
-                    self.timeout_query = timeout
-                else:
-                    err = msg
-                attempt += 1
-            except (requests.exceptions.ConnectionError,
-                    requests.exceptions.RequestException) as req_err:
-                # print(f"res: {res}")
-                self.err_msg = f"{req_err.__class__.__name__} Error: {req_err}"
-                self.err_occurred = True
-                self.log_msg(self.err_msg, 'error')
-                # attempt = self.attempts
-                return None
-            except KeyboardInterrupt:
-                self.err_msg = "Process ended by user."
-                self.log_msg(self.err_msg, out_indent='\n')
-                self.err_occurred = True
-                return None
-            except Exception:
-                msg = f"Unexpected error: {traceback.format_exc()}"
-                if attempt < self.attempts:
-                    msg = f"{msg}; attempting to connect again..."
-                    self.log_msg(msg, 'warning')
-                    res = None
-                else:
-                    err = msg
-                attempt += 1
-
-        if err is not None:
-            query_err = QueryError(err)
-
-            if self._check_auth(query_err):
-                return None
-
-            return query_err
-
-        # If no results from RAPI, return None
-        if res is None:
-            return None
-
-        # Check for exceptions that weren't already caught
-        if not res.ok:
-            except_err = self._get_exception(res)
-
-            if isinstance(except_err, QueryError):
-                if self._check_auth(except_err):
-                    return None
-
-                self.log_msg(msg, 'warning')
-                return except_err
-
-        if res.text == '':
-            return res
-
-        if res.text.find('BRB!') > -1:
-            self.err_msg = f"There was a problem while attempting to access the " \
-                  f"EODMS RAPI server. If the problem persists, please " \
-                  f"contact the EODMS Support Team at {self._email}."
-            self.log_msg(self.err_msg, 'error')
-            self.err_occurred = True
-            query_err = QueryError(self.err_msg)
-            return query_err
-
-        if as_json:
-            return res.json()
-        else:
-            return res
+        data = r.json() if isinstance(r, requests.Response) else r
+        self.search_results = data.get('results')
+            
+        return self.search_results
 
     def _to_camel_case(self, in_str):
         """
@@ -1592,6 +1336,16 @@ class EODMSRAPI:
         """
 
         return self.err_msg
+    
+    def get_msg(self):
+        """
+        Gets the latest self.msg
+
+        :return: The self.msg
+        :rtype: str
+        """
+
+        return self.msg
 
     def set_query_timeout(self, timeout):
         """
@@ -1601,7 +1355,7 @@ class EODMSRAPI:
         :type  timeout: float
 
         """
-        self.timeout_query = float(timeout)
+        self.rapi_session.set_query_timeout(timeout)
 
     def set_order_timeout(self, timeout):
         """
@@ -1611,7 +1365,7 @@ class EODMSRAPI:
         :type  timeout: float
 
         """
-        self.timeout_order = float(timeout)
+        self.rapi_session.set_order_timeout(timeout)
 
     def set_attempts(self, number):
         """
@@ -1622,7 +1376,7 @@ class EODMSRAPI:
         :type  number: int
 
         """
-        self.attempts = int(number)
+        self.rapi_session.set_attempts(number)
 
     def set_field_convention(self, convention):
         """
@@ -1799,23 +1553,11 @@ class EODMSRAPI:
 
         if self._check_auth():
             return None
+        
+        # print(f"url: {url}")
+        # answer = input("Press enter...")
 
-        # Use streamed download so we can wrap nicely with tqdm
-        if show_progress:
-            with self._session.get(url, stream=True, verify=self.verify) as stream:
-                with open(dest_fn, 'wb') as pipe:
-                    with tqdm.wrapattr(
-                            pipe,
-                            method='write',
-                            miniters=1,
-                            total=fsize,
-                            desc=f"{self._header}{os.path.basename(dest_fn)}"
-                    ) as file_out:
-                        for chunk in stream.iter_content(chunk_size=1024):
-                            file_out.write(chunk)
-        else:
-            response = self._session.get(url, stream=True, verify=self.verify)
-            open(dest_fn, "wb").write(response.content)
+        self.rapi_session.download(url, fsize, dest_fn, show_progress)
 
         if fsize is not None:
             if not os.path.exists(dest_fn) or os.stat(dest_fn).st_size != fsize:
@@ -1883,19 +1625,13 @@ class EODMSRAPI:
         self.log_msg(msg, log_indent='\n\n\t', out_indent='\n')
 
         if items is None:
-            msg = "No images to download."
-            self.log_msg(msg)
-            return []
-
+            return self.print_message("No images to download.")
         if isinstance(items, dict):
             if 'items' in items.keys():
                 items = items['items']
 
         if len(items) == 0:
-            msg = "No images to download."
-            self.log_msg(msg)
-            return []
-
+            return self.print_message("No images to download.")
         unique_items = self.remove_duplicate_orders(items)
 
         attempt = 0
@@ -1906,82 +1642,68 @@ class EODMSRAPI:
 
             if max_attempts is not None and not max_attempts == '':
                 if attempt > max_attempts:
-                    msg = "Maximum number of attempts reached."
-                    self.log_msg(msg, log_indent='\n\n\t', out_indent='\n')
+                    self.msg = "Maximum number of attempts reached."
+                    self.log_msg(self.msg, log_indent='\n\n\t', out_indent='\n')
                     return complete_items
 
-            # start, end = self._get_dateRange(unique_items)
-            # orders = self.get_orders(dtstart=start, dtend=end)
-            # print(f"max_downloads: {max_downloads}")
-            # answer = input("Press enter...")
-            # max_orders = max_downloads + int((max_downloads / 4))
-            # orders = self.get_orders(max_orders=max_orders)
             orders = self.get_orders(unique_items)
-
-            # for order in orders:
-            #     print(f"itemId: {order.get('itemId')}")
-            #     print(f"  orderId: {order.get('orderId')}")
-            #     print(f"  recordId: {order.get('recordId')}")
-            # answer = input("Press enter...")
 
             if self.err_occurred:
                 return complete_items
 
             if orders is None:
-                msg = "An error occurred while getting a list of orders. " \
-                      "Downloads unsuccessful."
-                self.log_msg(msg)
-                return []
-
+                return self.print_message(
+                    "An error occurred while getting a list of "
+                    "orders. Downloads unsuccessful."
+                )
             if len(orders) == 0:
-                msg = "No orders could be found."
-                self.log_msg(msg)
-                return []
-
+                return self.print_message("No orders could be found.")
             new_count = len(complete_items)
 
             for itm in unique_items:
                 item_id = itm['itemId']
                 cur_item = self._get_item_from_orders(item_id, orders)
+                if not cur_item:
+                    continue
                 order_id = cur_item['orderId']
                 status = cur_item['status']
                 record_id = cur_item['recordId']
                 coll_id = cur_item['collectionId']
 
                 # Check record is already complete
-                if self._check_complete(complete_items, record_id):
+                if self._check_complete(complete_items, item_id, record_id):
                     continue
 
                 if status in self.failed_status:
                     if status == 'FAILED':
                         # If the order has failed, inform user
                         status_mess = cur_item.get('statusMessage')
-                        msg = "\n  The following Order Item has failed:"
+                        self.msg = "\n  The following Order Item has failed:"
                         if status_mess is None:
-                            msg += f"\n    Order Item Id: " \
-                                   f"{cur_item['itemId']}\n" \
-                                   f"    Order Id: {order_id}\n" \
-                                   f"    Record Id: {cur_item['recordId']}" \
-                                   f"    Collection: {coll_id}\n"
+                            self.msg += f"\n    Order Item Id: " \
+                                       f"{cur_item['itemId']}\n" \
+                                       f"    Order Id: {order_id}\n" \
+                                       f"    Record Id: {cur_item['recordId']}" \
+                                       f"    Collection: {coll_id}\n"
 
                         else:
-                            msg += f"\n    Order Item Id: " \
-                                   f"{cur_item['itemId']}\n" \
-                                   f"    Order Id: {order_id}\n" \
-                                   f"    Record Id: {cur_item['recordId']}\n" \
-                                   f"    Collection: {coll_id}\n" \
-                                   f"    Reason for Failure: " \
-                                   f"{cur_item['statusMessage']}"
+                            self.msg += f"\n    Order Item Id: " \
+                                       f"{cur_item['itemId']}\n" \
+                                       f"    Order Id: {order_id}\n" \
+                                       f"    Record Id: {cur_item['recordId']}\n" \
+                                       f"    Collection: {coll_id}\n" \
+                                       f"    Reason for Failure: " \
+                                       f"{cur_item['statusMessage']}"
                     else:
                         # If the order was unsuccessful with another status,
                         #   inform user
-                        msg = f"\n  The following Order Item has status " \
-                              f"'{status}' and will not be downloaded:"
-                        msg += f"\n    Order Item Id: {cur_item['itemId']}\n" \
-                               f"    Record Id: {cur_item['recordId']}\n" \
-                               f"    Collection: {coll_id}\n"
+                        self.msg = f"\n  The following Order Item has status " \
+                                  f"'{status}' and will not be downloaded:"
+                        self.msg += f"\n    Order Item Id: {cur_item['itemId']}\n" \
+                                   f"    Record Id: {cur_item['recordId']}\n" \
+                                   f"    Collection: {coll_id}\n"
 
-                    self.log_msg(msg)
+                    self.log_msg(self.msg)
 
                     cur_item['downloaded'] = 'False'
 
@@ -2078,13 +1800,19 @@ class EODMSRAPI:
                     complete_items.append(cur_item)
 
             if new_count == 0 and len(complete_items) == 0:
-                msg = "No items are ready for download yet."
-                self.log_msg(msg)
+                self.msg = "No items are ready for download yet."
+                self.log_msg(self.msg)
             elif new_count == len(complete_items):
-                msg = "No new items are ready for download yet."
-                self.log_msg(msg)
+                self.msg = "No new items are ready for download yet."
+                self.log_msg(self.msg)
 
         return complete_items
+
+    # TODO Rename this here and in `download`
+    def print_message(self, msg):
+        self.msg = msg
+        self.log_msg(self.msg)
+        return []
 
     def get_available_fields(self, collection=None, name_type='all',
                              ui_fields=False):
@@ -2112,7 +1840,7 @@ class EODMSRAPI:
 
         query_url = f"{self.rapi_root}/collections/{collection}?format=json"
 
-        coll_res = self._submit(query_url, timeout=20.0)
+        coll_res = self.rapi_session.submit(query_url, timeout=20.0)
 
         if coll_res is None or self.err_occurred:
             return None
@@ -2163,7 +1891,7 @@ class EODMSRAPI:
 
         return fields
 
-    def get_field_choices(self, collection, field=None):
+    def get_field_choices(self, collection, field=None, full=False):
         """
         Gets the available choices for a specified field. If no choices exist,
         then the data type is returned.
@@ -2189,10 +1917,13 @@ class EODMSRAPI:
             if field is None:
                 field_choices = v.get('choices')
                 if field_choices is not None:
-                    for c in field_choices:
-                        value = c['value']
-                        if not value == '':
-                            choices.append(value)
+                    if full:
+                        choices = field_choices
+                    else:
+                        for c in field_choices:
+                            value = c['value']
+                            if not value == '':
+                                choices.append(value)
                     all_fields[f] = choices
                 else:
                     all_fields[f] = {'data_type': v.get('datatype')}
@@ -2200,10 +1931,13 @@ class EODMSRAPI:
                 if f == field or v['id'] == field:
                     field_choices = v.get('choices')
                     if field_choices is not None:
-                        for c in field_choices:
-                            value = c['value']
-                            if not value == '':
-                                choices.append(value)
+                        if full:
+                            choices = field_choices
+                        else:
+                            for c in field_choices:
+                                value = c['value']
+                                if not value == '':
+                                    choices.append(value)
                         return choices
                     else:
                         return {'data_type': v.get('datatype')}
@@ -2251,8 +1985,7 @@ class EODMSRAPI:
         logger.debug(f"RAPI URL: {query_url}")
 
         # Send the query URL
-        # print(f"query_url: {query_url}")
-        coll_res = self._submit(query_url, timeout=20.0)
+        coll_res = self.rapi_session.submit(query_url, timeout=20.0)
 
         if coll_res is None or self.err_occurred:
             return None
@@ -2325,12 +2058,9 @@ class EODMSRAPI:
         messages = (log_msg, msg)
         self.log_msg(messages, log_indent='\n\n\t', out_indent='\n')
 
-        res = self._submit(query, timeout=self.timeout_order)
+        res = self.rapi_session.submit(query, timeout=self.timeout_order)
 
-        if res is None or self.err_occurred:
-            return None
-
-        return res
+        return None if res is None or self.err_occurred else res
 
     def get_order(self, order_id):
         """
@@ -2348,18 +2078,18 @@ class EODMSRAPI:
         logger.debug(f"RAPI URL:\n\n{query_url}\n")
 
         # Send the query to the RAPI
-        res = self._submit(query_url, timeout=self.timeout_query, quiet=False)
+        res = self.rapi_session.submit(query_url, timeout=self.timeout_query, quiet=False)
 
         if self.err_occurred:
             return None
 
         if res is None or isinstance(res, QueryError):
             if isinstance(res, QueryError):
-                msg = f"Could not get order with Order ID {order_id} due " \
+                self.msg = f"Could not get order with Order ID {order_id} due " \
                       f"to {res.get_msgs(True)}."
             else:
-                msg = f"Could not get order with Order ID {order_id}."
-            self.log_msg(msg, 'warning')
+                self.msg = f"Could not get order with Order ID {order_id}."
+            self.log_msg(self.msg, 'warning')
             return None
 
         if 'items' in res.keys():
@@ -2378,6 +2108,9 @@ class EODMSRAPI:
         :param dtstart: The start date for the date range of the query.
         :type  dtstart: datetime.datetime
         :param dtend: The end date for the date range of the query.
+                    If a start date is set, the end date will be now().
+                    If an end date is set without a start date, an error will
+                        occur.
         :type  dtend: datetime.datetime
         :param max_orders: The maximum number of orders to retrieve.
         :type  max_orders: int
@@ -2389,9 +2122,6 @@ class EODMSRAPI:
         :return: A JSON dictionary of the query results containing the orders.
         :rtype:  dict
         """
-
-        msg = "Getting list of current orders..."
-        self.log_msg(msg)
 
         tm_frm = '%Y-%m-%dT%H:%M:%SZ'
 
@@ -2412,7 +2142,10 @@ class EODMSRAPI:
                 logger.debug(f"RAPI URL:\n\n{query_url}\n")
 
                 # Send the query to the RAPI
-                res = self._submit(query_url, timeout=self.timeout_query,
+                
+                msg = "Getting list of orders..."
+                self.log_msg(msg)
+                res = self.rapi_session.submit(query_url, timeout=self.timeout_query,
                                    quiet=False)
 
                 if self.err_occurred:
@@ -2420,12 +2153,12 @@ class EODMSRAPI:
 
                 if res is None or isinstance(res, QueryError):
                     if isinstance(res, QueryError):
-                        msg = f"Order submission was unsuccessful due to: " \
-                              f"{res.get_msgs(True)}."
+                        self.msg = f"Order submission was unsuccessful due " \
+                            f"to: {res.get_msgs(True)}."
 
                     else:
-                        msg = "Order submission was unsuccessful."
-                    self.log_msg(msg, 'warning')
+                        self.msg = "Order submission was unsuccessful."
+                    self.log_msg(self.msg, 'warning')
                     continue
 
                 if 'items' in res.keys():
@@ -2436,32 +2169,77 @@ class EODMSRAPI:
             return all_orders
 
         params = {}
-        if dtstart is not None:
-            params['dtstart'] = dtstart.strftime(tm_frm)
-            params['dtend'] = dtend.strftime(tm_frm)
+        extra_str = []
+        if dtstart is not None or dtend is not None:
+            if isinstance(dtstart, list):
+                dtstart = dtstart[0]
+            if isinstance(dtend, list):
+                dtend = dtend[0]
+
+            if dtstart and not dtend:
+                self.msg = "(Getting orders) A start date (dtstart) was " \
+                            "specified without an end date (dtend). Using " \
+                            "current time as end date."
+                self.log_msg(self.msg, 'warning')
+                dtend = datetime.now(timezone.utc)
+
+            if dtend and not dtstart:
+                self.msg = "(Getting orders) An end date (dtend) was " \
+                            "specified without a start date (dtstart). " \
+                            "Using start date of 1 month before end date."
+                self.log_msg(self.msg, 'warning')
+                dtstart = self._phrase_to_date(dtend) - relativedelta(months=1)
+
+            if dtstart:
+                params['dtstart'] = self._phrase_to_date(dtstart).strftime(tm_frm)
+            else:
+                self.msg = "(Getting orders) Could not determine start time. " \
+                            "Ignoring it."
+                self.log_msg(self.msg, 'warning')
+
+            if dtend:
+                params['dtend'] = self._phrase_to_date(dtend).strftime(tm_frm)
+            else:
+                self.msg = "(Getting orders) Could not determine end time. " \
+                            "Ignoring it."
+                self.log_msg(self.msg, 'warning')
+
         params['maxOrders'] = max_orders
         if status is not None:
             params['status'] = status.upper()
+        
+        if 'status' in params.keys():
+            extra_str.append(f"with status {params.get('status')}")
+
+        if 'dtstart' in params.keys() and 'dtend' in params.keys():
+            extra_str.append(f"between {params.get('dtstart')} " \
+                        f"and {params.get('dtend')}")
+
         param_str = urlencode(params)
 
+        if len(extra_str) == 0:
+            msg = f"Getting list of orders..."
+        else:
+            msg = f"Getting list of orders {' '.join(extra_str)}..."
+        self.log_msg(msg)
         query_url = f"{self.rapi_root}/order?{param_str}&format={out_format}"
 
         logger.debug(f"RAPI URL:\n\n{query_url}\n")
 
         # Send the query to the RAPI
-        res = self._submit(query_url, timeout=self.timeout_query, quiet=False)
+        res = self.rapi_session.submit(query_url, timeout=self.timeout_query, quiet=False)
 
         if self.err_occurred:
             return None
 
         if res is None or isinstance(res, QueryError):
             if isinstance(res, QueryError):
-                msg = f"Order submission was unsuccessful due to: " \
+                self.msg = f"Order submission was unsuccessful due to: " \
                       f"{res.get_msgs(True)}."
 
             else:
-                msg = "Order submission was unsuccessful."
-            self.log_msg(msg, 'warning')
+                self.msg = "Order submission was unsuccessful."
+            self.log_msg(self.msg, 'warning')
             return None
 
         if 'items' in res.keys():
@@ -2710,25 +2488,13 @@ class EODMSRAPI:
                 records = records['items']
 
         if records is None or len(records) == 0:
-            msg = "Cannot get orders as no image items provided."
-            self.log_msg(msg, log_indent='\n\n\t', out_indent='\n')
+            self.msg = "Cannot get orders as no image items provided."
+            self.log_msg(self.msg, log_indent='\n\n\t', out_indent='\n')
             return None
 
         if not all("orderId" in keys for keys in records):
-            # msg = "Cannot get orders as no orderId is provided in the " \
-            #       "results."
             orders = self.get_orders()
-            # self.log_msg(msg, log_indent='\n\n\t', out_indent='\n')
         else:
-
-            # dates = self._get_date_range(records)
-            #
-            # if dates is None:
-            #     msg = "Cannot get orders as no order dates are available."
-            #     self.log_msg(msg, log_indent='\n\n\t', out_indent='\n')
-            #     return None
-            #
-            # start, end = dates
 
             orders = self.get_orders(records)
 
@@ -2765,14 +2531,14 @@ class EODMSRAPI:
 
             found_orders.append(order_item)
 
-        msg = f"Found {len(found_orders)} order items for the following " \
+        self.msg = f"Found {len(found_orders)} order items for the following " \
               f"records: {', '.join([r['recordId'] for r in found_orders])}"
-        self.log_msg(msg)
+        self.log_msg(self.msg)
 
         if len(unfound) > 0:
-            msg = f"No order items found for the following records: " \
+            self.msg = f"No order items found for the following records: " \
                   f"{', '.join(unfound)}"
-            self.log_msg(msg)
+            self.log_msg(self.msg)
 
         return found_orders
 
@@ -2805,34 +2571,25 @@ class EODMSRAPI:
                     f"{record_id}?format=json"
 
         # Send the JSON request to the RAPI
-        try:
-            param_res = self._session.get(url=query_url, verify=self.verify)
-            param_res.raise_for_status()
-        except (requests.exceptions.HTTPError,
-                requests.exceptions.ConnectionError,
-                requests.exceptions.Timeout,
-                requests.exceptions.RequestException) as req_err:
-            msg = f"{req_err.__class__.__name__} Error: {req_err}"
-            self.log_msg(msg, 'warning')
-            return msg
-        except KeyboardInterrupt:
-            self.err_msg = "Process ended by user."
-            self.log_msg(self.err_msg, out_indent='\n')
-            self.err_occurred = True
-            print()
-            return None
+        param_res = self.rapi_session.submit(query_url)
 
-        if not param_res.ok:
+        if not param_res:
             err = self._get_exception(param_res)
             if isinstance(err, list):
-                msg = '; '.join(err)
-                self.log_msg(msg, 'warning')
-                return msg
+                self.msg = '; '.join(err)
+                self.log_msg(self.msg, 'warning')
+                return self.msg
 
         # msg = "Order removed successfully."
         # self.log_msg(msg)
 
-        return param_res.json()
+        return param_res
+
+    def get_rapi_metadata(self):
+        query_url = f"{self.rapi_root}/metadata"
+        res = self.rapi_session.submit(query_url)
+
+        return res
 
     def get_rapi_url(self):
         """ Gets the previous URL used to query the RAPI.
@@ -2841,7 +2598,7 @@ class EODMSRAPI:
         rtype: str
         """
 
-        return self._rapi_url
+        return self.rapi_url
 
     def get_record(self, collection, record_id, output='full'):
         """
@@ -2860,18 +2617,18 @@ class EODMSRAPI:
 
         self.collection = self.get_collection_id(collection)
 
-        self._rapi_url = f"{self.rapi_root}/record/{self.collection}/" \
+        self.rapi_url = f"{self.rapi_root}/record/{self.collection}/" \
                          f"{record_id}?format=json"
 
-        self.results = self._submit(self._rapi_url)
+        self.results = self.rapi_session.submit(self.rapi_url)
 
         if self.err_occurred:
             return None
 
         if isinstance(self.results, QueryError):
-            msg = self.results.get_msgs()
-            self.log_msg(msg, 'warning')
-            return {'errors': msg}
+            self.msg = self.results.get_msgs()
+            self.log_msg(self.msg, 'warning')
+            return {'errors': self.msg}
 
         if output == 'geojson':
             feat = self.geo.convert_to_geojson(self.results, 'list')
@@ -2899,41 +2656,23 @@ class EODMSRAPI:
         self.log_msg(msg, log_indent='\n\n\t', out_indent='\n')
 
         # Set the RAPI URL
-        self._rapi_url = f"{self.rapi_root}/order/{order_id}/{item_id}"
+        self.rapi_url = f"{self.rapi_root}/order/{order_id}/{item_id}"
 
         # Send the JSON request to the RAPI
-        cancel_res = self._submit(self._rapi_url, 'delete')
+        cancel_res = self.rapi_session.submit(self.rapi_url, 'delete')
 
         if self.err_occurred:
             return None
 
-        # try:
-        #     cancel_res = self._session.delete(url=self._rapi_url)
-        #     cancel_res.raise_for_status()
-        # except (requests.exceptions.HTTPError,
-        #         requests.exceptions.ConnectionError,
-        #         requests.exceptions.Timeout,
-        #         requests.exceptions.RequestException) as req_err:
-        #     err = self._get_exception(cancel_res).get_msgs()
-        #     msg = f"{req_err.__class__.__name__} Error: {req_err} - {err[1]}"
-        #     self.log_msg(msg, 'warning')
-        #     return msg
-        # except KeyboardInterrupt:
-        #     msg = "Process ended by user."
-        #     self.log_msg(msg, out_indent='\n')
-        #     self.err_occurred = True
-        #     print()
-        #     return None
-
         if not cancel_res.ok:
             err = self._get_exception(cancel_res)
             if isinstance(err, list):
-                msg = '; '.join(err)
-                self.log_msg(msg, 'warning')
-                return msg
+                self.msg = '; '.join(err)
+                self.log_msg(self.msg, 'warning')
+                return self.msg
 
-        msg = "Order removed successfully."
-        self.log_msg(msg)
+        self.msg = "Order removed successfully."
+        self.log_msg(self.msg)
 
         return cancel_res.content
 
@@ -3032,9 +2771,9 @@ class EODMSRAPI:
             if classification:
                 dest_info['classification'] = classification
 
-        self._rapi_url = f"{self.rapi_root}/order/destinations"
+        self.rapi_url = f"{self.rapi_root}/order/destinations"
         dest_json = json.dumps(dest_info)
-        dest_res = self._submit(self._rapi_url, 'post', dest_json)
+        dest_res = self.rapi_session.submit(self.rapi_url, 'post', dest_json)
 
         if self.err_occurred:
             return None
@@ -3066,7 +2805,7 @@ class EODMSRAPI:
                    f"{dest_name}"
 
         # Delete the given destination
-        dest_res = self._submit(dest_url, 'delete')
+        dest_res = self.rapi_session.submit(dest_url, 'delete')
 
         if self.err_occurred:
             return None
@@ -3178,7 +2917,7 @@ class EODMSRAPI:
         dest_url = f"{self.rapi_root}/order/destinations/{dest_type}/" \
                    f"{dest_name}"
         dest_json = json.dumps(dest_info)
-        dest_res = self._submit(dest_url, 'put', dest_json)
+        dest_res = self.rapi_session.submit(dest_url, 'put', dest_json)
 
         if self.err_occurred:
             return None
@@ -3207,20 +2946,20 @@ class EODMSRAPI:
         self.log_msg(msg, log_indent='\n\n\t', out_indent='\n')
 
         if collection is not None:
-            self._rapi_url = f"{self.rapi_root}/order/destinations?" \
+            self.rapi_url = f"{self.rapi_root}/order/destinations?" \
                              f"collection={collection}&recordId={record_id}"
         else:
-            self._rapi_url = f"{self.rapi_root}/order/destinations"
+            self.rapi_url = f"{self.rapi_root}/order/destinations"
 
-        self.results = self._submit(self._rapi_url)
+        self.results = self.rapi_session.submit(self.rapi_url)
 
         if self.err_occurred:
             return None
 
         if isinstance(self.results, QueryError):
-            msg = self.results.get_msgs()
-            self.log_msg(msg, 'warning')
-            return {'errors': msg}
+            self.msg = self.results.get_msgs()
+            self.log_msg(self.msg, 'warning')
+            return {'errors': self.msg}
 
         return self.results
 
@@ -3307,15 +3046,15 @@ class EODMSRAPI:
             params['resultField'] = ','.join(result_fields)
 
         query_str = urlencode(params)
-        self._rapi_url = f"{self.rapi_root}/search?{query_str}"
+        self.rapi_url = f"{self.rapi_root}/search?{query_str}"
 
         # Clear self.search_results
         self.search_results = []
 
         msg = f"Searching for {self.collection} images on RAPI"
         self.log_msg(msg, log_indent='\n\n\t', out_indent='\n')
-        logger.debug(f"RAPI URL:\n\n{self._rapi_url}\n")
-        print(f"RAPI URL:\n\n{self._rapi_url}\n")
+        logger.debug(f"RAPI URL:\n\n{self.rapi_url}\n")
+
         # Send the query to the RAPI
         self._submit_search()
 
@@ -3325,21 +3064,22 @@ class EODMSRAPI:
         self.res_mdata = None
 
         if isinstance(self.search_results, QueryError):
-            msg = self.search_results.get_msgs()
+            msgs = self.search_results.get_msgs()
             if isinstance(msgs, list):
                 self.log_msg(': '.join(msgs), 'warning')
             else:
                 self.log_msg(msgs, 'warning')
             return {'errors': msg}
 
-        msg = f"Number of {self.collection} images returned from RAPI: " \
+        self.msg = f"Number of {self.collection} images returned from RAPI: " \
               f"{len(self.search_results)}"
-        self.log_msg(msg)
+        self.log_msg(self.msg)
 
         self.results += self.search_results
 
     def search(self, collection, filters=None, features=None, dates=None,
-               result_fields=None, max_results=None):
+               result_fields=None, max_results=None, first_result=None, 
+               hit_count=False):
         """
         Sends a search to the RAPI to search for image results.
 
@@ -3386,6 +3126,10 @@ class EODMSRAPI:
         :param max_results: The maximum number of results to return from the
             query.
         :type  max_results: str or int
+        :param first_result: Specifies the starting index for the search.
+        :type  first_result: str or int
+        :param hit_count: Returns only the hit count for the search request.
+        :type  hit_count: boolean
 
         """
 
@@ -3397,12 +3141,14 @@ class EODMSRAPI:
         if self.collection is None or self.err_occurred:
             return None
 
-        params = {'collection': self.collection}
+        self.search_params = {'collection': self.collection}
 
         if filters is not None or features is not None or dates is not None:
-            params['query'] = self._parse_query(filters, features, dates)
+            self.search_params['query'] = self._parse_query(filters, features, 
+                                                            dates)
             if self.err_occurred:
                 return None
+        # print(f"query: {params['query']}")
 
         if isinstance(result_fields, str):
             result_fields = [result_fields]
@@ -3414,61 +3160,110 @@ class EODMSRAPI:
                 return None
 
             if field_id is None:
-                msg = f"Field '{field}'' does not exist for collection " \
+                self.msg = f"Field '{field}'' does not exist for collection " \
                       f"'{self.collection}'. Excluding it from resultField " \
                       f"entry."
-                self.log_msg(msg, 'warning')
+                self.log_msg(self.msg, 'warning')
             else:
                 result_field.append(field_id)
 
-        # Get the geometry field and add it to resultField
-        footprint_id = self._get_field_id('Footprint', field_type='results')
-        if self.err_occurred:
-            return None
-        if footprint_id is not None:
-            result_field.append(footprint_id)
+        for field in ['Footprint', 'Spatial Resolution', 'Download Link',
+                      'Archive ID']:
+            field_id = self._get_field_id(field, field_type='results')
+            
+            if self.err_occurred:
+                return None
+            
+            if field_id is not None:
+                result_field.append(field_id)
 
-        # Get the pixel spacing field and add it to resultField
-        pixspace_id = self._get_field_id('Spatial Resolution',
-                                         field_type='results')
-        if self.err_occurred:
-            return None
-        if pixspace_id is not None:
-            result_field.append(pixspace_id)
+        # # Get the geometry field and add it to resultField
+        # footprint_id = self._get_field_id('Footprint', field_type='results')
+        # if self.err_occurred:
+        #     return None
+        # if footprint_id is not None:
+        #     result_field.append(footprint_id)
 
-        # Get the pixel spacing field and add it to resultField
-        dl_id = self._get_field_id('Download Link', field_type='results')
-        if self.err_occurred:
-            return None
-        if dl_id is not None:
-            result_field.append(dl_id)
+        # # Get the pixel spacing field and add it to resultField
+        # pixspace_id = self._get_field_id('Spatial Resolution',
+        #                                  field_type='results')
+        # if self.err_occurred:
+        #     return None
+        # if pixspace_id is not None:
+        #     result_field.append(pixspace_id)
 
-        params['resultField'] = ','.join(result_field)
+        # # Get the pixel spacing field and add it to resultField
+        # dl_id = self._get_field_id('Download Link', field_type='results')
+        # if self.err_occurred:
+        #     return None
+        # if dl_id is not None:
+        #     result_field.append(dl_id)
 
-        params['maxResults'] = self.limit_interval
+        # # Get the Archive Id and add it to resultField
+        # dl_id = self._get_field_id('Archive ID', field_type='results')
+        # if self.err_occurred:
+        #     return None
+        # if dl_id is not None:
+        #     result_field.append(dl_id)
+
+        self.search_params['resultField'] = ','.join(result_field)
+
+        # params['maxResults'] = self.limit_interval
+        # print(f"max_results: {max_results}")
         if max_results is None or max_results == '':
             self.max_results = None
         else:
             self.max_results = int(max_results)
 
-            if self.max_results is not None:
-                params['maxResults'] = self.max_results \
-                    if int(self.max_results) < int(self.limit_interval) \
-                    else self.limit_interval
+        if first_result is not None:
+            self.search_params['firstResult'] = first_result
 
-        params['format'] = "json"
+        # print(f"self.max_results: {self.max_results}")
 
-        query_str = urlencode(params)
-        self._rapi_url = f"{self.rapi_root}/search?{query_str}"
+            # if self.max_results is not None:
+            #     params['maxResults'] = self.max_results \
+            #         if int(self.max_results) < int(self.limit_interval) \
+            #         else self.limit_interval
+
+        self.search_params['format'] = "json"
+
+        if hit_count:
+            self.search_params['hitCount'] = 'true'
+
+        return self._submit_search_query()
+
+    def _submit_search_query(self):
+
+        if 'format' not in self.search_params.keys():
+            self.search_params['format'] = 'json'
+
+        # if 'maxResults' not in query_params.keys():
+        #     query_params['maxResults'] = self.limit_interval
+        # else:
+        #     self.max_results = int(query_params['maxResults'])
+            
+        if self.max_results:
+            self.search_params['maxResults'] = self.max_results
+
+        query_str = urlencode(self.search_params)
+        self.rapi_url = f"{self.rapi_root}/search?{query_str}"
 
         # Clear self.search_results
         self.search_results = []
 
-        msg = f"Searching for {self.collection} images on RAPI"
-        self.log_msg(msg, log_indent='\n\n\t', out_indent='\n')
-        logger.debug(f"RAPI URL:\n\n{self._rapi_url}\n")
+        show_log = False
+        if not self.search_params.get('hitCount'):
+            show_log = True
+
+        if show_log:
+            msg = f"Searching for {self.collection} images on RAPI"
+            self.log_msg(msg, log_indent='\n\n\t', out_indent='\n')
+            logger.debug(f"RAPI URL:\n\n{self.rapi_url}\n")
         # Send the query to the RAPI
-        self._submit_search()
+        src_res = self._submit_search(show_log)
+
+        if self.search_params.get('hitCount'):
+            return src_res
 
         self.res_mdata = None
 
@@ -3480,11 +3275,29 @@ class EODMSRAPI:
                 self.log_msg(msgs, 'warning')
             return {'errors': msgs}
 
-        msg = f"Number of {self.collection} images returned from RAPI: " \
-              f"{len(self.search_results)}"
-        self.log_msg(msg)
+        search_total = len(self.search_results)
+        self.msg = f"Number of {self.collection} images returned from RAPI: " \
+              f"{search_total}"
+        self.log_msg(self.msg)
 
         self.results += self.search_results
+
+        return search_total
+
+    def reset(self):
+        """
+        Resets specific values for the EODMSRAPI.
+
+        :return: n/a
+        """
+
+        self.clear_results()
+        self.err_msg = None
+        self.msg = ''
+        self.err_occurred = False
+        self.auth_err = False
+        self.order_info = None
+        self.search_results = None
 
     def clear_results(self):
         """
@@ -3521,9 +3334,9 @@ class EODMSRAPI:
         """
 
         if self.results is None:
-            msg = "No results exist. Please use search() to run a search " \
-                  "on the RAPI."
-            self.log_msg(msg, 'warning')
+            self.msg = "No results exist. Please use search() to run a " \
+                "search on the RAPI."
+            self.log_msg(self.msg, 'warning')
             return None
 
         if isinstance(self.results, QueryError):
@@ -3575,7 +3388,7 @@ class EODMSRAPI:
 
     def remove_duplicate_orders(self, orders):
         """
-        Removes any duplicate images from a list of orders
+        Removes any duplicate images from a list of orders.
 
         :param orders: A list of orders.
         :type  orders: list
@@ -3584,35 +3397,114 @@ class EODMSRAPI:
         :rtype:  list
         """
 
-        # Get duplicate record IDs
-        rec_ids = [o['recordId'] for o in orders]
-        dup_ids = list(set([x for x in rec_ids if rec_ids.count(x) > 1]))
+        # order_items = [o.get('itemId') for o in orders]
 
         unique_orders = []
-        for o in orders:
-            rec_id = o['recordId']
-            if rec_id in dup_ids:
-                # For the duplicate, get the latest order
-                filt_ords = [order for order in orders
-                             if order['recordId'] == rec_id]
+        for order in orders:
 
-                for order in filt_ords:
-                    if 'dateRapiOrdered' in order.keys():
-                        order['dateSubmitted'] = order['dateRapiOrdered']
-                        del order['dateRapiOrdered']
+            order_item = order.get('itemId')
+            if order_item in [o.get('itemId') for o in unique_orders]:
+                continue
+            
+            # Determine if order is SAR Toolbox
+            params = order.get('parameters')
+            params = order.get('parameters') \
+                        if order.get('parameters') else order
+            if 'Vap_Request_UUID' in params.keys():
+                unique_orders.append(order)
+                continue
 
-                if 'dateSubmitted' in filt_ords[0]:
-                    date_sort = sorted(filt_ords,
-                                    key=lambda d: d['dateSubmitted'],
-                                    reverse=True)
-                else:
-                    date_sort = filt_ords
-                if rec_id not in [order['recordId'] for order in unique_orders]:
-                    unique_orders.append(date_sort[0])
-            else:
-                unique_orders.append(o)
+            exist_rec_ids = []
+            for o in unique_orders:
+                params = o.get('parameters') if o.get('parameters') else o
+                if 'Vap_Request_UUID' not in params.keys():
+                    exist_rec_ids.append(o.get('recordId'))
 
+            if order.get('recordId') in exist_rec_ids:
+                continue
+
+            unique_orders.append(order)
+              
         return unique_orders
+               
+                       
+                      
+        # return unique_orders
+
+    def order_json(self, in_json, priority=None):
+        """
+        Sends a JSON order request to the EODMS RAPI.
+
+        :param in_json: The input JSON request.
+        :type  in_json: dict
+        :param priority: The priority for the Order request.
+        :type  priority: str
+
+        :return: A JSON of the order sent to the RAPI (or an error if the 
+                request was unsuccessful).
+        :rtype:  dict or str (error message)
+        """
+
+        # print(f"in_json: {in_json}")
+
+        msg = "Submitting order items..."
+        self.log_msg(msg, log_indent='\n\n\t', out_indent='\n')
+
+        # Set the RAPI URL for the POST
+        self.rapi_url = f"{self.rapi_root}/order"
+
+        # logger.debug(f"RAPI URL:\n\n{self.rapi_url}\n")
+        self.log_msg(f"RAPI URL:\n\n{self.rapi_url}\n")
+
+        # Send the JSON request to the RAPI
+        time_submitted = datetime.now(tzlocal()).isoformat()
+
+        # Add the 'Content-Type' option to the header
+        self.rapi_session.add_header('Content-Type', 'application/json')
+
+        # Set the priority
+        if priority:
+            items = []
+            for item in in_json.get('items'):
+                item['priority'] = priority.title()
+                items.append(item)
+            in_json['items'] = items
+
+        post_json = json.dumps(in_json)
+        # logger.debug(f"RAPI POST:\n\n{post_json}\n")
+        self.log_msg(f"RAPI POST:\n\n{post_json}\n")
+        order_res = self.rapi_session.submit(self.rapi_url, 'POST', post_json)
+
+        if self.err_occurred:
+            return None
+
+        if order_res is None:
+            err = self._get_exception(order_res)
+            if isinstance(err, list):
+                self.msg = '; '.join(err)
+                self.log_msg(self.msg, 'warning')
+                return self.msg
+
+        if isinstance(order_res, requests.Response) and not order_res.ok:
+            self.err_msg = "Order submission failed."
+            self.log_msg(self.err_msg, 'error')
+            self.err_occurred = True
+            return self.err_msg
+        
+        if isinstance(order_res, QueryError):
+            self.err_msg = f"Order submission failed - " \
+                            f"{order_res.get_msgs(True)}"
+            self.log_msg(self.err_msg, 'error')
+            self.err_occurred = True
+            return order_res
+
+        # Add the time the order was submitted
+        items = order_res['items']
+
+        for i in items:
+            i['dateRapiOrdered'] = time_submitted
+
+        return items
 
     def order(self, results, priority="Medium", parameters=None,
               destinations=None):
@@ -3673,6 +3565,10 @@ class EODMSRAPI:
         :param destinations: A JSON representation of an array of order
             destinations
         :type  destinations: list
+
+        :return: A JSON of the order sent to the RAPI (or an error if the 
+                request was unsuccessful).
+        :rtype:  dict or str (error message)
         """
 
         if destinations is None:
@@ -3681,11 +3577,15 @@ class EODMSRAPI:
         self.log_msg(msg, log_indent='\n\n\t', out_indent='\n')
 
         # Add the 'Content-Type' option to the header
-        self._session.headers.update({'Content-Type': 'application/json'})
+        # self._session.headers.update({'Content-Type': 'application/json'})
+        self.rapi_session.add_header('Content-Type', 'application/json')
 
         # Create the items from the list of results
         coll_key = self.get_conv('collectionId')
         recid_key = self.get_conv('recordId')
+
+        if isinstance(results, dict):
+            results = [results]
 
         items = []
         for r in results:
@@ -3716,23 +3616,24 @@ class EODMSRAPI:
             items.append(item)
 
         # Create the dictionary for the POST request JSON
-        self.order_json = [{"destinations": destinations,
+        self.order_info = [{"destinations": destinations,
                         "items": items[i:i + 100]} for i in range(0, len(items),
                                                                   100)]
         # Set the RAPI URL for the POST
-        self._rapi_url = f"{self.rapi_root}/order"
+        self.rapi_url = f"{self.rapi_root}/order"
 
-        logger.debug(f"RAPI URL:\n\n{self._rapi_url}\n")
+        logger.debug(f"RAPI URL:\n\n{self.rapi_url}\n")
 
         # Send the JSON request to the RAPI
-        time_submitted = datetime.datetime.now(tzlocal()).isoformat()
+        time_submitted = datetime.now(tzlocal()).isoformat()
         # order_res = None
         all_items = []
-        for p in self.order_json:
+        for p in self.order_info:
             # Dump the dictionary into a JSON object
             post_json = json.dumps(p)
             logger.debug(f"RAPI POST:\n\n{post_json}\n")
-            order_res = self._submit(self._rapi_url, 'POST', post_json)
+            order_res = self.rapi_session.submit(self.rapi_url, 'POST', 
+                                                 post_json)
 
             if self.err_occurred:
                 return None
@@ -3740,9 +3641,9 @@ class EODMSRAPI:
             if order_res is None:
                 err = self._get_exception(order_res)
                 if isinstance(err, list):
-                    msg = '; '.join(err)
-                    self.log_msg(msg, 'warning')
-                    return msg
+                    self.msg = '; '.join(err)
+                    self.log_msg(self.msg, 'warning')
+                    return self.msg
 
             if isinstance(order_res, requests.Response) and not order_res.ok:
                 self.err_msg = "Order submission failed."
@@ -3760,7 +3661,7 @@ class EODMSRAPI:
 
         final_res = {'items': all_items}
 
-        msg = "Order submitted successfully."
-        self.log_msg(msg)
+        self.msg = "Order submitted successfully."
+        self.log_msg(self.msg)
 
         return final_res

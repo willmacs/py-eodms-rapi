@@ -12,6 +12,7 @@ _build.bat
 build/
 develop-eggs/
 dist/
+dist_backup/
 old_dist/
 downloads/
 eggs/
@@ -57,4 +58,5 @@ _update_repository.bat
 eodms_rapi/backup*/
 eodms_rapi/*.bak
 old_docs/
+open_env.ps1
 *.bak

@@ -2,7 +2,7 @@
 # MIT License
 #
 # Copyright (c) His Majesty the King in Right of Canada, as
-# represented by the Minister of Natural Resources, 2022.
+# represented by the Minister of Natural Resources, 2023.
 #
 # Permission is hereby granted, free of charge, to any person obtaining a
 # copy of this software and associated documentation files (the "Software"),
@@ -27,7 +27,7 @@
 __title__ = 'py-eodms-rapi Tester'
 __author__ = 'Kevin Ballantyne'
 __copyright__ = 'Copyright (c) His Majesty the King in Right of Canada, ' \
-                'as represented by the Minister of Natural Resources, 2022'
+                'as represented by the Minister of Natural Resources, 2023'
 __license__ = 'MIT License'
 __description__ = 'Performs various tests of the py-eodms-rapi Python package.'
 __email__ = 'eodms-sgdot@nrcan-rncan.gc.ca'
@@ -179,6 +179,28 @@ class TestEodmsRapi(unittest.TestCase):
 
         res = rapi.get_results('full')
         print(f"Number of results: {len(res)}")
+
+    def test_wrong_creds(self):
+        rapi = eodms_rapi.EODMSRAPI('dflgkhdfgjkh', 'sdfglkdfhgjkf')
+
+        colls = rapi.get_collections()
+
+    def test_st_orders(self):
+
+        rapi = eodms_rapi.EODMSRAPI(os.getenv('EODMS_USER'),
+                                    os.environ.get('EODMS_PASSWORD'))
+
+        order_id = os.environ.get('ORDER_ID')
+        if order_id is None:
+            order_id = 708364
+
+        print(f"order_id: {order_id}")
+        order_res = rapi.get_order(order_id)
+        dest = "files/downloads"
+        os.makedirs(dest, exist_ok=True)
+        dn_res = rapi.download(order_res, dest, max_attempts=100)
+
+        print(f"dn_res: {dn_res}")
 
 if __name__ == '__main__':
     unittest.main()
